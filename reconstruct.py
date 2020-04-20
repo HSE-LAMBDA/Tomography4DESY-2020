@@ -6,6 +6,9 @@ from skimage.transform import iradon
 import radontea
 from scipy.interpolate import interp1d
 import math
+from tqdm import tqdm
+import tensorflow as tf
+
 
 
 def get_from_mat(filename):
@@ -53,6 +56,88 @@ def correct_image(img, shifts, linear_interpolation=True, **args):
 
 
 
+def np_iradon_custom(sino, angles, filtering=True, circle=True):
+    ln = sino.shape[1]
+    # filetring:
+    if filtering:
+        kx = 2 * np.pi * np.abs(np.fft.fftfreq(ln))
+        kx = kx[None, :]
+        projection = np.fft.fft(sino, axis=0) * kx
+        sino_filtered = np.real(np.fft.ifft(projection, axis=0))
+        # Resize filtered sinogram back to original size
+        sino = sino_filtered[:, :ln]
+    
+    # main process:
+    fourier_sino = np.fft.rfft(sino, axis=0)
+    wfilt = np.linspace(0, fourier_sino.shape[0], fourier_sino.shape[0])[:,np.newaxis]
+    #wfilt *= (np.cos(wfilt * np.pi / 2))**2
+    backprojections = np.fft.irfft(fourier_sino * wfilt, axis=0)
+    result = np.zeros(dtype=float, shape=backprojections.shape[:1] * 2)
+    size = result.shape[0]
+    xx, yy = np.meshgrid(*[np.linspace(-(size - 1) / 2., (size - 1) / 2., size)] * 2)
+    for th, backproj in zip(angles, backprojections.T):
+        th *= np.pi / 180.
+        coords = xx * np.cos(th) + yy * np.sin(th) + (size - 1) / 2
+        ccoords = np.ceil(coords).astype(int)
+        fcoords = np.floor(coords).astype(int)
+# #         print(th, coords, ccoords, fcoords)
+        cmask = (ccoords >= 0) & (ccoords < size)
+        fmask = (fcoords >= 0) & (fcoords < size)
+        wc = 1 - (ccoords - coords)
+        wf = 1 - (coords - fcoords)
+#         print(wc, wf)
+        result += backproj[np.where(cmask, ccoords, 0)] * wc + \
+                    backproj[np.where(fmask, fcoords, 0)] * wf
+    if circle:
+        out_reconstruction_circle = (xx ** 2 + yy ** 2) >= ((size - 1) / 2) ** 2
+        result[out_reconstruction_circle] = 0.
+    return result / len(angles) / (2. * np.pi)
+
+
+
+def tf_iradon_custom(sino, angles, filtering=True, circle=True):
+    sino = tf.convert_to_tensor(sino, dtype=tf.float64)
+    angles = tf.convert_to_tensor(angles * np.pi / 180., dtype=tf.float64)
+    
+    if filtering:
+        ln = sino.shape[1]
+        kx = 2 * np.pi * np.abs(np.fft.fftfreq(ln))
+        kx = kx[None, :]
+        kx = tf.convert_to_tensor(kx, dtype=tf.float64)
+        sino_prepared = tf.transpose(tf.cast(sino, tf.complex128))
+        projection = tf.transpose(tf.signal.fft(sino_prepared)) * tf.cast(kx, tf.complex128)
+        sino_filtered = tf.transpose(tf.math.real(tf.signal.ifft(tf.transpose(projection))))
+        # Resize filtered sinogram back to original size
+        sino = sino_filtered[:, :ln]
+    
+    # main process:
+    fourier_sino = tf.transpose(tf.signal.rfft(tf.transpose(sino)))  # maybe 2d?
+    shape = tf.shape(fourier_sino)[0]
+    wfilt = tf.linspace(0., tf.cast(shape, dtype=tf.float64), shape)[:, None]
+    wfilt = tf.cast(wfilt, tf.complex128)
+    backprojections = tf.transpose(tf.signal.irfft(tf.transpose(fourier_sino * wfilt)))
+    size = tf.shape(backprojections)[0]
+    result = tf.zeros(dtype=tf.float64, shape=[size] * 2)
+    xx, yy = tf.meshgrid(*[tf.linspace(-(size - 1) / 2, (size - 1) / 2, size)] * 2)
+    backprojections = tf.transpose(backprojections)
+    for th, backproj in zip(angles, backprojections):
+        coords = tf.cast(xx, tf.float64) * tf.cos(th) + tf.cast(yy, tf.float64) * tf.sin(th) + (tf.cast(size, tf.float64) - 1.) / 2.
+        ccoords = tf.cast(tf.math.ceil(coords), tf.int32)
+        fcoords = tf.cast(tf.math.floor(coords), tf.int32)
+        cmask = tf.math.logical_and(ccoords >= 0, ccoords < size)
+        fmask = tf.math.logical_and(fcoords >= 0, fcoords < size)
+        wc = 1. - (tf.cast(ccoords, tf.float64) - coords)
+        wf = 1. - (coords - tf.cast(fcoords, tf.float64))
+        result += tf.gather(backproj, tf.where(cmask, ccoords, 0)) * wc + \
+                tf.gather(backproj, tf.where(fmask, fcoords, 0)) * wf
+    result = result.numpy() / angles.shape[0] / (2. * np.pi)
+    if circle:
+        out_reconstruction_circle = (xx.numpy() ** 2 + yy.numpy() ** 2) >= ((size.numpy() - 1) / 2) ** 2
+        result[out_reconstruction_circle] = 0.
+    return result
+
+
+
 def iradon_centered(image, angles, center, kind='linear', lib='scipy', show=False):
     '''
     Apply inverse randon transform to image.
@@ -86,6 +171,10 @@ def iradon_centered(image, angles, center, kind='linear', lib='scipy', show=Fals
         reco = radontea.backproject(fixed_image, angles)
     elif lib == 'scipy':
         reco = iradon(fixed_image.T, angles * 180 / np.pi)
+    elif lib == 'custom_np':
+        reco = np_iradon_custom(fixed_image.T, angles * 180 / np.pi)
+    elif lib == 'custom_tf':
+        reco = tf_iradon_custom(fixed_image.T, angles * 180 / np.pi)
     else:
         raise NotImplemented('This lib is unknown')
     if show:

@@ -1,4 +1,5 @@
 # tomopy:
+apt-get update -y
 apt-get install libopencv-dev -y
 pip install scikit-build
 pip install mkl-devel
